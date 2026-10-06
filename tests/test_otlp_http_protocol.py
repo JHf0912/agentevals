@@ -18,6 +18,7 @@ import json
 
 import httpx
 import pytest
+from google.rpc import code_pb2
 from google.rpc.status_pb2 import Status
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceResponse
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceResponse
@@ -180,14 +181,18 @@ class TestContentEncoding:
         )
         assert resp.status_code == 200
 
-    async def test_unsupported_content_encoding_is_rejected(self, otlp_client):
+    @pytest.mark.parametrize("encoding", ["br", "deflate", "zstd"])
+    async def test_unsupported_content_encoding_is_rejected(self, otlp_client, encoding):
+        """415, not 400: collectors offer these too, and the message names the fix."""
         resp = await otlp_client.post(
             "/v1/traces",
             content=b"whatever",
-            headers={"Content-Type": JSON, "Content-Encoding": "br"},
+            headers={"Content-Type": JSON, "Content-Encoding": encoding},
         )
-        assert resp.status_code == 400
-        assert "br" in status_message(resp.content, resp.headers["content-type"])
+        assert resp.status_code == 415
+        message = status_message(resp.content, resp.headers["content-type"])
+        assert encoding in message
+        assert "gzip" in message
 
     @pytest.mark.parametrize(
         "payload",
@@ -271,6 +276,64 @@ class TestContentEncoding:
         assert resp.status_code == 200
         assert worker_threads, "decompression was never called"
         assert worker_threads[0] != loop_thread, "decompression ran on the event loop thread"
+
+    async def test_large_body_parsing_runs_off_the_event_loop(self, otlp_client, monkeypatch):
+        """Decode is threaded too, not just decompression.
+
+        Parsing dominates: decode_protobuf_traces measures ~40ms per MiB (~1.2s for
+        a 32 MiB export), and it used to run entirely on the loop shared with the
+        dashboard API, the UI streams and the gRPC receiver.
+        """
+        import threading
+
+        import agentevals.api.otlp_http as otlp_http
+
+        loop_thread = threading.get_ident()
+        parse_threads: list[int] = []
+        original = otlp_http._parse_body
+
+        def spy(raw, decode_protobuf, media_type, container_key):
+            parse_threads.append(threading.get_ident())
+            return original(raw, decode_protobuf, media_type, container_key)
+
+        monkeypatch.setattr(otlp_http, "_parse_body", spy)
+        # Force the threaded branch; the real threshold is exercised by size.
+        monkeypatch.setattr(otlp_http, "PARSE_THREAD_THRESHOLD", 1)
+
+        resp = await otlp_client.post(
+            "/v1/traces",
+            content=json.dumps(trace_request("off-loop-parse")).encode(),
+            headers={"Content-Type": JSON},
+        )
+
+        assert resp.status_code == 200
+        assert parse_threads, "parse was never called"
+        assert parse_threads[0] != loop_thread, "body parsing ran on the event loop thread"
+
+    async def test_small_body_parsing_stays_inline(self, otlp_client, monkeypatch):
+        """Below the threshold the thread hop is skipped; the work is negligible."""
+        import threading
+
+        import agentevals.api.otlp_http as otlp_http
+
+        loop_thread = threading.get_ident()
+        parse_threads: list[int] = []
+        original = otlp_http._parse_body
+
+        def spy(raw, decode_protobuf, media_type, container_key):
+            parse_threads.append(threading.get_ident())
+            return original(raw, decode_protobuf, media_type, container_key)
+
+        monkeypatch.setattr(otlp_http, "_parse_body", spy)
+
+        resp = await otlp_client.post(
+            "/v1/traces",
+            content=json.dumps(trace_request("inline-parse")).encode(),
+            headers={"Content-Type": JSON},
+        )
+
+        assert resp.status_code == 200
+        assert parse_threads == [loop_thread]
 
     async def test_empty_members_within_the_cap_are_accepted(self, otlp_client):
         """Concatenated members are legal gzip, so a body within the cap still works."""
@@ -402,44 +465,33 @@ class TestContentEncoding:
         assert resp.status_code == 413
 
 
-class TestResponseCompression:
-    async def test_response_is_gzipped_when_client_accepts(self, otlp_client):
-        resp = await otlp_client.post(
-            "/v1/traces",
-            content=json.dumps(trace_request("resp-gzip")).encode(),
-            headers={"Content-Type": JSON, "Accept-Encoding": "gzip"},
-        )
-        assert resp.status_code == 200
-        assert resp.headers.get("content-encoding") == "gzip"
+class TestResponsesAreNotCompressed:
+    """Response compression is deliberately absent (see `build_export_response`).
 
-    async def test_response_is_not_gzipped_for_identity(self, otlp_client):
-        # httpx advertises gzip by default, so this must be explicit.
+    OTLP does not ask for it, Export responses are a few bytes, and Go clients
+    advertise gzip automatically -- so compressing would inflate the common case.
+    These pin that decision against someone re-adding the feature.
+    """
+
+    @pytest.mark.parametrize("accept_encoding", ["gzip", "identity", "gzip;q=0.5", "GZIP"])
+    async def test_responses_are_never_gzipped(self, otlp_client, accept_encoding):
         resp = await otlp_client.post(
             "/v1/traces",
-            content=json.dumps(trace_request("resp-identity")).encode(),
-            headers={"Content-Type": JSON, "Accept-Encoding": "identity"},
+            content=json.dumps(trace_request("resp-compression")).encode(),
+            headers={"Content-Type": JSON, "Accept-Encoding": accept_encoding},
         )
         assert resp.status_code == 200
         assert "content-encoding" not in resp.headers
+        assert json.loads(resp.content) == {}
 
-    @pytest.mark.parametrize(
-        ("header", "expected"),
-        [
-            pytest.param("gzip;q=0", None, id="q-zero-refuses"),
-            pytest.param("gzip;q=0.5", "gzip", id="q-half-accepts"),
-            pytest.param("identity, gzip;q=0.5", "gzip", id="gzip-not-the-first-token"),
-            pytest.param("GZIP", "gzip", id="case-insensitive"),
-            pytest.param("br, deflate", None, id="no-gzip-offered"),
-        ],
-    )
-    async def test_accept_encoding_parameters_are_honoured(self, otlp_client, header, expected):
+    async def test_error_responses_are_never_gzipped(self, otlp_client):
         resp = await otlp_client.post(
             "/v1/traces",
-            content=json.dumps(trace_request("resp-q")).encode(),
-            headers={"Content-Type": JSON, "Accept-Encoding": header},
+            content=b"{not json",
+            headers={"Content-Type": JSON, "Accept-Encoding": "gzip"},
         )
-        assert resp.status_code == 200
-        assert resp.headers.get("content-encoding") == expected
+        assert resp.status_code == 400
+        assert "content-encoding" not in resp.headers
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +540,41 @@ class TestErrorResponses:
         resp = await otlp_client.post("/v1/traces", content=b"x", headers={"Content-Type": "text/plain"})
         assert resp.status_code == 415
         assert status_message(resp.content, resp.headers["content-type"])
+
+    @pytest.mark.parametrize(
+        ("body", "content_type", "expected_status", "expected_code"),
+        [
+            pytest.param(b"{not json", JSON, 400, code_pb2.INVALID_ARGUMENT, id="400"),
+            pytest.param(b"x", "text/plain", 415, code_pb2.INVALID_ARGUMENT, id="415"),
+        ],
+    )
+    async def test_error_status_carries_a_grpc_code(
+        self, otlp_client, body, content_type, expected_status, expected_code
+    ):
+        """`Status.code` is populated so clients that branch on it never see OK.
+
+        `google.rpc.Status.code` is declared `int32` (the `Code` enum is only a set
+        of constants), so it renders as a number rather than a name.
+        """
+        resp = await otlp_client.post("/v1/traces", content=body, headers={"Content-Type": content_type})
+
+        assert resp.status_code == expected_status
+        assert json.loads(resp.content)["code"] == expected_code
+
+    async def test_resource_exhausted_code_on_the_size_cap(self, otlp_client, monkeypatch):
+        monkeypatch.setattr("agentevals.api.otlp_http.MAX_REQUEST_BYTES", 64)
+        resp = await otlp_client.post("/v1/traces", content=b"x" * 4096, headers={"Content-Type": JSON})
+
+        assert resp.status_code == 413
+        assert json.loads(resp.content)["code"] == code_pb2.RESOURCE_EXHAUSTED
+
+    async def test_error_status_carries_a_grpc_code_over_protobuf(self, otlp_client):
+        resp = await otlp_client.post("/v1/traces", content=b"\xff\xff\xff", headers={"Content-Type": PROTOBUF})
+
+        assert resp.status_code == 400
+        decoded = Status.FromString(resp.content)
+        assert decoded.code == code_pb2.INVALID_ARGUMENT
+        assert decoded.message
 
     async def test_missing_trace_manager_returns_503_with_status_body(self):
         """`require_trace_manager` fails during dependency resolution, before the handler."""
@@ -653,6 +740,42 @@ class TestPartialSuccess:
         resp = await otlp_client.post("/v1/logs", content=b"", headers={"Content-Type": PROTOBUF})
         assert resp.status_code == 200
         assert not ExportLogsServiceResponse.FromString(resp.content).HasField("partial_success")
+
+
+# ---------------------------------------------------------------------------
+# Body size bounding
+# ---------------------------------------------------------------------------
+
+
+class TestBodySizeBound:
+    async def test_declared_oversized_body_is_rejected(self, otlp_client, monkeypatch):
+        """A Content-Length over the cap is refused before the body is read."""
+        monkeypatch.setattr("agentevals.api.otlp_http.MAX_REQUEST_BYTES", 1024)
+        resp = await otlp_client.post("/v1/traces", content=b"x" * 4096, headers={"Content-Type": JSON})
+        assert resp.status_code == 413
+
+    async def test_chunked_oversized_body_is_rejected_midstream(self, otlp_client, monkeypatch):
+        """A body with no Content-Length is stopped while streaming, not after buffering.
+
+        Without the running total this would be read in full and only then judged.
+        """
+        monkeypatch.setattr("agentevals.api.otlp_http.MAX_REQUEST_BYTES", 1024)
+
+        async def unbounded():
+            for _ in range(64):
+                yield b"x" * 1024
+
+        resp = await otlp_client.post("/v1/traces", content=unbounded(), headers={"Content-Type": JSON})
+        assert resp.status_code == 413
+
+    async def test_body_within_the_cap_is_accepted(self, otlp_client, monkeypatch):
+        monkeypatch.setattr("agentevals.api.otlp_http.MAX_REQUEST_BYTES", 1024 * 1024)
+        resp = await otlp_client.post(
+            "/v1/traces",
+            content=json.dumps(trace_request("within-cap")).encode(),
+            headers={"Content-Type": JSON},
+        )
+        assert resp.status_code == 200
 
 
 # ---------------------------------------------------------------------------

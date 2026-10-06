@@ -9,7 +9,6 @@ response builders from `otlp_processing.py` instead.
 from __future__ import annotations
 
 import asyncio
-import gzip
 import json
 import logging
 import zlib
@@ -18,6 +17,7 @@ from collections.abc import Callable
 from fastapi import FastAPI, Request, Response
 from google.protobuf.json_format import MessageToJson
 from google.protobuf.message import DecodeError, Message
+from google.rpc import code_pb2
 from google.rpc.status_pb2 import Status
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -48,7 +48,28 @@ MAX_GZIP_MEMBERS = 32
 # zlib window bits for a gzip stream: 16 (gzip framing) + 15 (max window size).
 _GZIP_WBITS = 31
 
+# Parsing a decompressed body costs about 40ms per MiB (measured: ~1.2s for a
+# 32 MiB protobuf export), all of it on the event loop unless it is threaded.
+# Below this size the thread hop costs more than the work it moves.
+PARSE_THREAD_THRESHOLD = 1024 * 1024
+
 _SUPPORTED_CONTENT_ENCODINGS = frozenset({"", "identity", "gzip"})
+
+# OTLP asks servers to populate Status.code; these are the mappings from the
+# reference Go receiver's statusutil helper. Status.code carries no meaning to
+# OTLP itself ("this specification does not use Status.code"), but clients that
+# branch on it see something sensible instead of OK.
+_GRPC_STATUS_CODES = {
+    400: code_pb2.INVALID_ARGUMENT,
+    404: code_pb2.NOT_FOUND,
+    405: code_pb2.UNIMPLEMENTED,
+    413: code_pb2.RESOURCE_EXHAUSTED,
+    415: code_pb2.INVALID_ARGUMENT,
+    429: code_pb2.RESOURCE_EXHAUSTED,
+    500: code_pb2.INTERNAL,
+    503: code_pb2.UNAVAILABLE,
+}
+_GRPC_STATUS_CODE_DEFAULT = code_pb2.UNKNOWN
 
 
 class OtlpError(Exception):
@@ -92,7 +113,11 @@ def _decode_content_encoding(request: Request, raw: bytes) -> bytes:
     if encoding in ("", "identity"):
         return raw
     if encoding not in _SUPPORTED_CONTENT_ENCODINGS:
-        raise OtlpError(400, f"Unsupported Content-Encoding {encoding!r}; supported encodings: gzip")
+        # 415 rather than 400: collectors offer deflate/zstd/snappy too, so anyone
+        # who picks one gets a permanent drop either way -- 415 is what RFC 9110
+        # §15.5.16 defines for content in an unsupported format, and it reads more
+        # clearly in an exporter's logs. Name the fix in the message.
+        raise OtlpError(415, f"Unsupported Content-Encoding {encoding!r}; set compression: gzip or none")
     if len(raw) > MAX_COMPRESSED_BYTES:
         raise OtlpError(413, f"Compressed request body exceeds {MAX_COMPRESSED_BYTES} bytes")
 
@@ -166,21 +191,57 @@ async def read_export_request(
     fails as a 400 rather than crashing the pipeline as a 500.
     """
     media_type = resolve_media_type(request)
-    body_bytes = await request.body()
-    if len(body_bytes) > MAX_REQUEST_BYTES:
-        raise OtlpError(413, f"Request body exceeds {MAX_REQUEST_BYTES} bytes")
+    body_bytes = await _read_bounded_body(request)
 
-    # Decompression is CPU-bound. Run it in a worker thread: this process also
-    # serves the dashboard API and the gRPC receiver on one event loop, so blocking
-    # here would stall all of them.
+    # Decompression runs in a worker thread unconditionally: its cost is not
+    # predictable from the input size, because a small body can expand enormously.
+    # This process serves the dashboard API, the UI streams and the gRPC receiver
+    # on one event loop, so blocking here would stall all of them.
     raw = await asyncio.to_thread(_decode_content_encoding, request, body_bytes)
 
     if not raw:
         return {}, media_type
 
+    # Parsing is proportional to the decompressed size, which is now known, so the
+    # thread hop is only worth paying above the threshold.
+    if len(raw) < PARSE_THREAD_THRESHOLD:
+        return _parse_body(raw, decode_protobuf, media_type, container_key), media_type
+
+    body = await asyncio.to_thread(_parse_body, raw, decode_protobuf, media_type, container_key)
+    return body, media_type
+
+
+async def _read_bounded_body(request: Request) -> bytes:
+    """Read the request body, refusing anything larger than ``MAX_REQUEST_BYTES``.
+
+    ``Content-Length`` is checked first so an honest oversized upload is rejected
+    before it is read, then bytes are counted as they arrive so a chunked or
+    understated upload still stops at the cap rather than after it.
+    """
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
+        raise OtlpError(413, f"Request body exceeds {MAX_REQUEST_BYTES} bytes")
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_REQUEST_BYTES:
+            raise OtlpError(413, f"Request body exceeds {MAX_REQUEST_BYTES} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _parse_body(
+    raw: bytes,
+    decode_protobuf: Callable[[bytes], dict],
+    media_type: str,
+    container_key: str,
+) -> dict:
+    """Decode a decompressed export body. Synchronous; callers thread it when large."""
     if media_type == PROTOBUF_MEDIA_TYPE:
         try:
-            return decode_protobuf(raw), media_type
+            return decode_protobuf(raw)
         except DecodeError as exc:
             raise OtlpError(400, f"Unable to parse Protobuf request body: {exc}") from exc
 
@@ -197,43 +258,20 @@ async def read_export_request(
     if not isinstance(containers, list) or any(not isinstance(item, dict) for item in containers):
         raise OtlpError(400, f"Malformed OTLP payload: {container_key!r} must be a list of objects")
 
-    return body, media_type
+    return body
 
 
-def _accepts_gzip(request: Request) -> bool:
-    """Whether the client advertised gzip in ``Accept-Encoding``."""
-    for part in request.headers.get("accept-encoding", "").split(","):
-        token, _, params = part.partition(";")
-        if token.strip().lower() != "gzip":
-            continue
-        quality = 1.0
-        for param in params.split(";"):
-            key, _, value = param.partition("=")
-            if key.strip().lower() == "q":
-                try:
-                    quality = float(value)
-                except ValueError:
-                    quality = 0.0
-        return quality > 0
-    return False
+def build_export_response(message: Message, media_type: str) -> Response:
+    """Serialize an ``Export<signal>ServiceResponse``, mirroring the request's Content-Type.
 
-
-def _finalize_response(request: Request, payload: bytes, content_type: str, status_code: int) -> Response:
-    """Wrap a payload, gzip-encoding it when the client accepts that."""
-    headers: dict[str, str] = {}
-    # An empty payload is left alone: a full-success protobuf response is zero
-    # bytes, and gzip framing would turn it into a non-empty body for no gain.
-    if payload and _accepts_gzip(request):
-        payload = gzip.compress(payload)
-        headers["content-encoding"] = "gzip"
-    return Response(content=payload, status_code=status_code, media_type=content_type, headers=headers)
-
-
-def build_export_response(request: Request, message: Message, media_type: str) -> Response:
-    """Serialize an ``Export<signal>ServiceResponse``, mirroring the request's Content-Type."""
+    Responses are deliberately never compressed. OTLP does not ask for it, an
+    Export response is a few bytes (a full success serializes to zero bytes), and
+    Go clients advertise ``Accept-Encoding: gzip`` automatically -- so compressing
+    would inflate the common case rather than shrink it.
+    """
     if media_type == PROTOBUF_MEDIA_TYPE:
-        return _finalize_response(request, message.SerializeToString(), PROTOBUF_MEDIA_TYPE, 200)
-    return _finalize_response(request, MessageToJson(message).encode("utf-8"), JSON_MEDIA_TYPE, 200)
+        return Response(content=message.SerializeToString(), status_code=200, media_type=PROTOBUF_MEDIA_TYPE)
+    return Response(content=MessageToJson(message).encode("utf-8"), status_code=200, media_type=JSON_MEDIA_TYPE)
 
 
 def build_status_response(
@@ -255,10 +293,13 @@ def build_status_response(
         except OtlpError:
             media_type = JSON_MEDIA_TYPE
 
-    status = Status(message=message)
+    status = Status(
+        code=_GRPC_STATUS_CODES.get(status_code, _GRPC_STATUS_CODE_DEFAULT),
+        message=message,
+    )
     if media_type == PROTOBUF_MEDIA_TYPE:
-        return _finalize_response(request, status.SerializeToString(), PROTOBUF_MEDIA_TYPE, status_code)
-    return _finalize_response(request, MessageToJson(status).encode("utf-8"), JSON_MEDIA_TYPE, status_code)
+        return Response(content=status.SerializeToString(), status_code=status_code, media_type=PROTOBUF_MEDIA_TYPE)
+    return Response(content=MessageToJson(status).encode("utf-8"), status_code=status_code, media_type=JSON_MEDIA_TYPE)
 
 
 def register_otlp_exception_handlers(app: FastAPI) -> None:

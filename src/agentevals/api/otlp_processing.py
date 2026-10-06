@@ -69,6 +69,24 @@ class ExportResult:
         return "; ".join(f"{count} {reason}" for reason, count in self.rejected_reasons.items())
 
 
+def _log_rejections(signal: str, result: ExportResult) -> None:
+    """Warn once per export about dropped records.
+
+    Once per request, not per record: a long batch arriving at a capped session
+    would otherwise flood the log, and the exporter already surfaces the partial
+    success on its own side.
+    """
+    if not result.rejected:
+        return
+    logger.warning(
+        "OTLP %s export rejected %d of %d records: %s",
+        signal,
+        result.rejected,
+        result.rejected + result.accepted,
+        result.error_message,
+    )
+
+
 async def process_traces(body: dict, manager: StreamingTraceManager) -> ExportResult:
     """Parse ExportTraceServiceRequest and feed spans to the pipeline."""
     result = ExportResult()
@@ -103,7 +121,6 @@ async def process_traces(body: dict, manager: StreamingTraceManager) -> ExportRe
                 session = await manager.get_or_create_otlp_session(trace_id, metadata)
 
                 if not session.can_accept_span():
-                    logger.warning("Session %s at span limit", session.session_id)
                     result.reject(f"span(s) rejected: session has reached maximum span limit ({MAX_SPANS_PER_SESSION})")
                     continue
 
@@ -130,6 +147,7 @@ async def process_traces(body: dict, manager: StreamingTraceManager) -> ExportRe
                     session.has_root_span = True
                     manager.schedule_session_completion(session.session_id)
 
+    _log_rejections("trace", result)
     return result
 
 
@@ -183,7 +201,6 @@ async def process_logs(body: dict, manager: StreamingTraceManager) -> ExportResu
                     continue
 
                 if not session.can_accept_log():
-                    logger.warning("Session %s at log limit", session.session_id)
                     result.reject(
                         f"log record(s) rejected: session has reached maximum log limit ({MAX_LOGS_PER_SESSION})"
                     )
@@ -207,6 +224,7 @@ async def process_logs(body: dict, manager: StreamingTraceManager) -> ExportResu
     for session_id in sessions_needing_reextraction:
         manager.schedule_log_reextraction(session_id)
 
+    _log_rejections("log", result)
     return result
 
 

@@ -37,7 +37,7 @@ async def receive_traces(
     """OTLP HTTP trace receiver (ExportTraceServiceRequest)."""
     body, media_type = await read_export_request(request, decode_protobuf_traces, "resourceSpans")
     result = await process_traces(body, manager)
-    return build_export_response(request, build_traces_response(result), media_type)
+    return build_export_response(build_traces_response(result), media_type)
 
 
 @otlp_router.post("/v1/logs")
@@ -48,4 +48,4 @@ async def receive_logs(
     """OTLP HTTP log receiver (ExportLogsServiceRequest)."""
     body, media_type = await read_export_request(request, decode_protobuf_logs, "resourceLogs")
     result = await process_logs(body, manager)
-    return build_export_response(request, build_logs_response(result), media_type)
+    return build_export_response(build_logs_response(result), media_type)
