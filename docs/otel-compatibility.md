@@ -157,10 +157,75 @@ Both accept traces and logs and feed into the same session manager.
 
 ### OTLP HTTP
 
-| Endpoint | Content Types |
-|----------|--------------|
-| `/v1/traces` | `application/json`, `application/x-protobuf` |
-| `/v1/logs` | `application/json`, `application/x-protobuf` |
+| Endpoint | Content Types | Request compression |
+|----------|--------------|---------------------|
+| `/v1/traces` | `application/json`, `application/x-protobuf` | `gzip`, `identity` |
+| `/v1/logs` | `application/json`, `application/x-protobuf` | `gzip`, `identity` |
+
+Responses mirror the request's `Content-Type` and are never compressed: an Export response is only a
+few bytes (a full success serializes to zero bytes), and gzip framing would inflate it. A stock OTel
+Collector needs no configuration for requests: its OTLP exporter gzip-compresses by default and that
+is supported here.
+
+#### Conformance
+
+| Condition | Response |
+|-----------|----------|
+| Payload undecodable (bad JSON, bad protobuf, corrupt or truncated gzip) | `400` — permanent, clients must not retry |
+| Payload decodable but structurally invalid (e.g. `resourceSpans` is not a list of objects) | `400` |
+| Unsupported `Content-Encoding` (`br`, `deflate`, `zstd`, `snappy`, …) | `415` — set `compression: gzip` or `none` on the exporter |
+| Body exceeds 64 MiB on the wire | `413` |
+| Body exceeds 64 MiB after decompression | `413` |
+| gzip body exceeds 8 MiB compressed | `413` |
+| gzip body has more than 32 concatenated members | `400` |
+| Unrecognized `Content-Type` | `415` (a missing header is treated as JSON) |
+| Success, nothing dropped | `200` with `partial_success` unset |
+| Success, some records dropped | `200` with `partial_success` populated |
+
+Request bodies are bounded on both paths and in both directions: the wire body at 64 MiB
+(compressed or not) and the decompressed output at 64 MiB, with a tighter 8 MiB cap on compressed
+input. The wire cap holds during the upload — `Content-Length` is checked before the body is read,
+and the bytes are counted as they arrive, so an oversized chunked upload is stopped partway rather
+than buffered first. Concatenated gzip members are counted as well, because decoding cost scales
+with member count rather than output — a body of 20-byte empty members costs CPU in proportion to its
+size while producing nothing, so a member cap is what actually bounds the work. Real exporters emit a
+single member; 32 is generous headroom.
+
+Decompression and decoding both run off the event loop, which this process shares with the dashboard
+API, the UI streams and the gRPC receiver; parsing dominates at roughly 40 ms per MiB.
+
+Because `413` is permanent, a collector drops the whole batch rather than retrying or splitting it —
+so if you export large batches (full prompts in span attributes add up), cap the batch size in bytes
+on the exporter's sending queue, e.g. the Collector's `sending_queue`/`batch` settings.
+
+Every `4xx`/`5xx` body is a `google.rpc.Status` message, with `Status.code` populated
+(`INVALID_ARGUMENT` for `400`/`415`, `RESOURCE_EXHAUSTED` for `413`, `INTERNAL` for `500`,
+`UNAVAILABLE` for `503`). Its encoding
+mirrors the request, so the response's own `Content-Type` stays honest — the same choice the
+reference Go OTLP receiver makes. The specification's literal wording ("the response body for all
+`HTTP 4xx` and `HTTP 5xx` responses MUST be a Protobuf-encoded `Status` message") carries no JSON
+exemption; mirroring is the reading that does not also violate the Content-Type rule.
+
+#### Partial success
+
+When records are dropped the receiver still returns `200`, but populates `partial_success` with
+`rejected_spans` / `rejected_log_records` and an English `error_message`. Per the specification,
+clients must not retry such a response.
+
+Counted as rejected:
+
+- Spans and logs dropped at the per-session caps (10,000 spans / 5,000 logs — see
+  [streaming.md](streaming.md))
+- Records with no `trace_id`, which cannot be routed to a session
+
+Not counted as rejected:
+
+- Log records that are not `gen_ai.*` events. These are filtered by design: agentevals ingests
+  GenAI-semconv telemetry, and an application instrumented with many libraries emits far more
+  non-GenAI logs than GenAI ones. Reporting them would attach a permanent warning to every export
+  with no action a user could take.
+- Log records buffered for orphan replay. Those are deferred, not rejected — they may still be
+  attached to a session, or expire.
 
 ### OTLP gRPC
 
@@ -172,6 +237,9 @@ Implements the standard `TraceService/Export` and `LogsService/Export` RPCs. Con
 | Max concurrent RPCs | 32 |
 | Compression | gzip |
 | TLS | off (insecure) |
+
+Dropped records are reported through `partial_success` exactly as over OTLP HTTP — see
+[Partial success](#partial-success) above.
 
 ### Client configuration
 
