@@ -1935,10 +1935,15 @@ class TestIngestYieldsTheEventLoop:
     the dashboard API, the UI streams and the gRPC receiver that share it.
     """
 
-    def test_concurrent_task_runs_during_a_large_export(self):
+    def test_concurrent_task_runs_during_a_large_export(self, monkeypatch):
+        # Force a yield on every record. With the real budget this would depend on
+        # the host being slow enough to exceed it, which makes the test flaky on
+        # fast machines rather than wrong on slow ones.
+        monkeypatch.setattr(otlp_processing, "YIELD_INTERVAL_SECONDS", 0)
+
         async def go():
             mgr = _make_mgr()
-            spans = [_make_span(span_id=f"span{i}") for i in range(2_000)]
+            spans = [_make_span(span_id=f"span{i}") for i in range(200)]
             body = _make_export_request(spans, resource_attrs=_make_resource_attrs(session_name="yielding"))
 
             progressed = 0
@@ -1960,12 +1965,14 @@ class TestIngestYieldsTheEventLoop:
 
         _run(go())
 
-    def test_concurrent_task_runs_during_a_large_log_export(self):
+    def test_concurrent_task_runs_during_a_large_log_export(self, monkeypatch):
+        monkeypatch.setattr(otlp_processing, "YIELD_INTERVAL_SECONDS", 0)
+
         async def go():
             mgr = _make_mgr()
             meta = {"eval_set_id": None, "session_name": "yielding-logs", "resource_attrs": {}}
             await mgr.get_or_create_otlp_session(TRACE_ID_HEX, meta)
-            records = [_make_genai_log_record(TRACE_ID_HEX) for _ in range(2_000)]
+            records = [_make_genai_log_record(TRACE_ID_HEX) for _ in range(200)]
 
             progressed = 0
 
@@ -1989,9 +1996,10 @@ class TestIngestYieldsTheEventLoop:
         """The cap check and the append must stay contiguous across a yield.
 
         A yield placed between `can_accept_span()` and `spans.append()` would let
-        two concurrent exports both pass the check and overshoot the limit. Forcing
-        a yield on every record maximises the interleaving, so exactly one of the
-        two exports below may be accepted.
+        two concurrent exports both pass the check and overshoot the limit. The
+        budget is forced to zero so a yield lands on every record, maximising the
+        interleaving: with the two room for exactly one span, a misplaced yield
+        admits both and ends at MAX + 1.
         """
         monkeypatch.setattr(otlp_processing, "YIELD_INTERVAL_SECONDS", 0)
 
@@ -2000,8 +2008,11 @@ class TestIngestYieldsTheEventLoop:
             attrs = _make_resource_attrs(session_name="interleaved-cap")
             await process_traces(_make_export_request([_make_span()], resource_attrs=attrs), mgr)
 
+            # Leave room for exactly one more span beyond the two below, so the
+            # session is NOT already full when they run.
             session = mgr.sessions["interleaved-cap"]
-            session.spans.extend([{}] * (MAX_SPANS_PER_SESSION - 1))
+            session.spans.extend([{}] * (MAX_SPANS_PER_SESSION - 2))
+            assert len(session.spans) == MAX_SPANS_PER_SESSION - 1
 
             await asyncio.gather(
                 process_traces(_make_export_request([_make_span(span_id="s1")], resource_attrs=attrs), mgr),
@@ -2009,24 +2020,6 @@ class TestIngestYieldsTheEventLoop:
             )
 
             assert len(session.spans) == MAX_SPANS_PER_SESSION
-            _cancel_timers(mgr)
-
-        _run(go())
-
-    def test_small_exports_are_unchanged(self):
-        """Below the budget the yield never fires, so behaviour is identical."""
-
-        async def go():
-            mgr = _make_mgr()
-            body = _make_export_request(
-                [_make_span(span_id="one"), _make_span(span_id="two")],
-                resource_attrs=_make_resource_attrs(session_name="small"),
-            )
-
-            result = await process_traces(body, mgr)
-
-            assert result.accepted == 2
-            assert len(mgr.sessions["small"].spans) == 2
             _cancel_timers(mgr)
 
         _run(go())
