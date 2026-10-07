@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -69,6 +71,18 @@ class ExportResult:
         return "; ".join(f"{count} {reason}" for reason, count in self.rejected_reasons.items())
 
 
+# The ingest loops hold the event loop for the whole export -- measured ~136 ms for
+# 6,000 spans, and ~2 s at the request-size cap -- and none of the `await`s inside
+# them actually suspend, because the SSE queues they publish to are unbounded and
+# `Queue.put` never awaits a Future. Yield explicitly so one large export cannot
+# freeze the dashboard API, the UI streams and the gRPC receiver that share the loop.
+#
+# Budgeted in time rather than records: the per-record cost varies by ~2x with load,
+# so a fixed record count bounds the wrong quantity. This caps how long the loop is
+# held at a stretch, whatever the payload looks like.
+YIELD_INTERVAL_SECONDS = 0.01
+
+
 def _log_rejections(signal: str, result: ExportResult) -> None:
     """Warn once per export about dropped records.
 
@@ -90,6 +104,7 @@ def _log_rejections(signal: str, result: ExportResult) -> None:
 async def process_traces(body: dict, manager: StreamingTraceManager) -> ExportResult:
     """Parse ExportTraceServiceRequest and feed spans to the pipeline."""
     result = ExportResult()
+    last_yield = time.monotonic()
 
     for resource_span in body.get("resourceSpans", []):
         resource_attrs = resource_span.get("resource", {}).get("attributes", [])
@@ -106,6 +121,15 @@ async def process_traces(body: dict, manager: StreamingTraceManager) -> ExportRe
             schema_url = scope_span.get("schemaUrl", "") or resource_schema_url
 
             for span_data in scope_span.get("spans", []):
+                # Yield at the TOP of the record body, never between the cap check and
+                # the append further down. Nothing in this loop suspends today, so
+                # `can_accept_span()` -> `spans.append()` is atomic and the cap is
+                # exact; a suspension point between those two lines would let
+                # concurrent exports both pass the check and overshoot the limit.
+                if time.monotonic() - last_yield >= YIELD_INTERVAL_SECONDS:
+                    last_yield = time.monotonic()
+                    await asyncio.sleep(0)
+
                 span = _normalize_span(span_data, scope_name, scope_version, schema_url)
                 trace_id = span.get("traceId", "")
 
@@ -165,6 +189,7 @@ async def process_logs(body: dict, manager: StreamingTraceManager) -> ExportResu
     """
     result = ExportResult()
     sessions_needing_reextraction: set[str] = set()
+    last_yield = time.monotonic()
 
     for resource_log in body.get("resourceLogs", []):
         resource_attrs = resource_log.get("resource", {}).get("attributes", [])
@@ -173,6 +198,12 @@ async def process_logs(body: dict, manager: StreamingTraceManager) -> ExportResu
 
         for scope_log in resource_log.get("scopeLogs", []):
             for log_record in scope_log.get("logRecords", []):
+                # Yields at the top of the record body for the same reason as
+                # `process_traces`: keep the cap check and the append contiguous.
+                if time.monotonic() - last_yield >= YIELD_INTERVAL_SECONDS:
+                    last_yield = time.monotonic()
+                    await asyncio.sleep(0)
+
                 log_event = _convert_otlp_log_record(log_record)
                 if not log_event:
                     continue
